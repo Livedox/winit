@@ -1183,6 +1183,20 @@ impl Window {
             selection: TextSpan { start: selection.0, end: selection.1 },
             compose_region: None,
         });
+
+        // The IME caches the text it has seen; ask it to re-read the buffer
+        // after the contents have been changed programmatically.
+        if let Ok(vm) = unsafe { jni::JavaVM::from_raw(self.app.vm_as_ptr() as *mut _) } {
+            if let Ok(mut env) = vm.get_env() {
+                let activity = unsafe {
+                    jni::objects::JObject::from_raw(self.app.activity_as_ptr() as *mut _)
+                };
+
+                if let Err(err) = env.call_method(&activity, "restartIme", "()V", &[]) {
+                    warn!("Failed to restart the input method: {err:?}");
+                }
+            }
+        }
     }
 
     /// Returns the current contents of the platform IME buffer.
