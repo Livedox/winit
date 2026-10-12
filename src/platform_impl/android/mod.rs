@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{
+    InputEvent, KeyAction, Keycode, MotionAction, TextInputState, TextSpan,
+};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -33,6 +35,73 @@ pub(crate) use crate::cursor::{
 pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
+
+/// State of the platform IME text buffer.
+///
+/// `winit` doesn't know the contents of the focused widget, so it can't use
+/// them as the initial IME buffer contents. Instead the buffer is kept empty
+/// and every edit reported by the platform is turned into a diff against the
+/// previously seen buffer contents, which is translated into
+/// [`Ime`][event::Ime] events and synthetic backspaces.
+struct ImeBuffer {
+    /// The last contents reported by the platform, excluding the composing
+    /// region (which is reported through `Ime::Preedit` instead).
+    text: String,
+    /// Whether the platform reported a composing region in the last event.
+    composing: bool,
+    /// Whether an `Ime::Enabled` event was sent for the current session.
+    enabled: bool,
+    /// Whether `Ime::Enabled` / `Ime::Disabled` still have to be dispatched.
+    pending_enabled: bool,
+    pending_disabled: bool,
+}
+
+static IME_BUFFER: Mutex<ImeBuffer> = Mutex::new(ImeBuffer {
+    text: String::new(),
+    composing: false,
+    enabled: false,
+    pending_enabled: false,
+    pending_disabled: false,
+});
+
+/// Returns the index rounded down to the nearest UTF-8 boundary of `text`.
+fn char_boundary_before(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+
+    index
+}
+
+/// Returns the length (in bytes, aligned to UTF-8 boundaries) of the common
+/// prefix and suffix of the given strings.
+fn ime_diff(previous: &str, next: &str) -> (usize, usize) {
+    let previous_bytes = previous.as_bytes();
+    let next_bytes = next.as_bytes();
+    let max_prefix = previous_bytes.len().min(next_bytes.len());
+
+    let mut prefix = 0;
+    while prefix < max_prefix && previous_bytes[prefix] == next_bytes[prefix] {
+        prefix += 1;
+    }
+    prefix = char_boundary_before(previous, prefix);
+
+    let max_suffix = previous_bytes.len().min(next_bytes.len()) - prefix;
+    let mut suffix = 0;
+    while suffix < max_suffix
+        && previous_bytes[previous_bytes.len() - 1 - suffix]
+            == next_bytes[next_bytes.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    while suffix > 0 && !previous.is_char_boundary(previous.len() - suffix) {
+        suffix -= 1;
+    }
+
+    (prefix, suffix)
+}
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
 /// equates to an infinite timeout, not a zero timeout (so can't just use
@@ -303,6 +372,42 @@ impl<T: 'static> EventLoop<T> {
             trace!("No main event to handle");
         }
 
+        // Notify the application about pending IME state changes
+        {
+            let (enabled, disabled) = {
+                let mut ime = IME_BUFFER.lock().unwrap();
+
+                let enabled = std::mem::replace(&mut ime.pending_enabled, false);
+                let disabled = std::mem::replace(&mut ime.pending_disabled, false);
+
+                if enabled {
+                    ime.enabled = true;
+                }
+
+                if disabled {
+                    ime.enabled = false;
+                }
+
+                (enabled, disabled)
+            };
+
+            if enabled {
+                let event = event::Event::WindowEvent {
+                    window_id: window::WindowId(WindowId),
+                    event: event::WindowEvent::Ime(event::Ime::Enabled),
+                };
+                callback(event, self.window_target());
+            }
+
+            if disabled {
+                let event = event::Event::WindowEvent {
+                    window_id: window::WindowId(WindowId),
+                    event: event::WindowEvent::Ime(event::Ime::Disabled),
+                };
+                callback(event, self.window_target());
+            }
+        }
+
         // temporarily decouple `android_app` from `self` so we aren't holding
         // a borrow of `self` while iterating
         let android_app = self.android_app.clone();
@@ -473,12 +578,142 @@ impl<T: 'static> EventLoop<T> {
                     },
                 }
             },
+            InputEvent::TextEvent(state) => {
+                self.handle_ime_text(state, callback);
+            },
             _ => {
                 warn!("Unknown android_activity input event {event:?}")
             },
         }
 
         input_status
+    }
+
+    fn handle_ime_text<F>(&mut self, state: &TextInputState, callback: &mut F)
+    where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        let (enabled, preedit, backspaces, commit) = {
+            let mut ime = IME_BUFFER.lock().unwrap();
+
+            let enabled = !ime.enabled;
+            if enabled {
+                ime.enabled = true;
+                ime.pending_enabled = false;
+            }
+
+            let composing = state
+                .compose_region
+                .filter(|span| span.start < span.end)
+                .map(|span| {
+                    (
+                        char_boundary_before(&state.text, span.start),
+                        char_boundary_before(&state.text, span.end),
+                    )
+                })
+                .filter(|(start, end)| start < end);
+
+            let base = match composing {
+                Some((start, end)) => {
+                    let mut base = String::with_capacity(state.text.len());
+                    base.push_str(&state.text[..start]);
+                    base.push_str(&state.text[end..]);
+                    base
+                },
+                None => state.text.clone(),
+            };
+
+            let previous = std::mem::replace(&mut ime.text, base.clone());
+
+            let mut preedit = None;
+            let mut backspaces = 0;
+            let mut commit = None;
+
+            if let Some((start, end)) = composing {
+                let cursor =
+                    if state.selection.start >= start && state.selection.end <= end {
+                        Some((state.selection.start - start, state.selection.end - start))
+                    } else {
+                        None
+                    };
+
+                preedit = Some((state.text[start..end].to_owned(), cursor));
+                ime.composing = true;
+            } else if ime.composing {
+                preedit = Some((String::new(), None));
+                ime.composing = false;
+            }
+
+            let (prefix, suffix) = ime_diff(&previous, &base);
+
+            if prefix != previous.len() || suffix != base.len() {
+                let removed = &previous[prefix..previous.len() - suffix];
+                let inserted = &base[prefix..base.len() - suffix];
+
+                // The platform may wipe the buffer on its own (e.g. after the
+                // keyboard was hidden); that shouldn't be reported as the user
+                // deleting the whole text.
+                if removed != previous {
+                    backspaces = removed.chars().count();
+                }
+
+                if !inserted.is_empty() {
+                    commit = Some(inserted.to_owned());
+                }
+            }
+
+            (enabled, preedit, backspaces, commit)
+        };
+
+        if enabled {
+            let event = event::Event::WindowEvent {
+                window_id: window::WindowId(WindowId),
+                event: event::WindowEvent::Ime(event::Ime::Enabled),
+            };
+            callback(event, self.window_target());
+        }
+
+        if let Some((content, cursor)) = preedit {
+            let event = event::Event::WindowEvent {
+                window_id: window::WindowId(WindowId),
+                event: event::WindowEvent::Ime(event::Ime::Preedit(content, cursor)),
+            };
+            callback(event, self.window_target());
+        }
+
+        for _ in 0..backspaces {
+            for state in [event::ElementState::Pressed, event::ElementState::Released] {
+                let key_event = event::KeyEvent {
+                    state,
+                    physical_key: crate::keyboard::PhysicalKey::Code(
+                        crate::keyboard::KeyCode::Backspace,
+                    ),
+                    logical_key: crate::keyboard::Key::Named(crate::keyboard::NamedKey::Backspace),
+                    location: crate::keyboard::KeyLocation::Standard,
+                    repeat: false,
+                    text: None,
+                    platform_specific: KeyEventExtra {},
+                };
+
+                let event = event::Event::WindowEvent {
+                    window_id: window::WindowId(WindowId),
+                    event: event::WindowEvent::KeyboardInput {
+                        device_id: event::DeviceId(DeviceId::dummy()),
+                        event: key_event,
+                        is_synthetic: true,
+                    },
+                };
+                callback(event, self.window_target());
+            }
+        }
+
+        if let Some(text) = commit {
+            let event = event::Event::WindowEvent {
+                window_id: window::WindowId(WindowId),
+                event: event::WindowEvent::Ime(event::Ime::Commit(text)),
+            };
+            callback(event, self.window_target());
+        }
     }
 
     pub fn run<F>(mut self, event_handler: F) -> Result<(), EventLoopError>
@@ -916,7 +1151,24 @@ impl Window {
     pub fn set_ime_cursor_area(&self, _position: Position, _size: Size) {}
 
     pub fn set_ime_allowed(&self, allowed: bool) {
+        {
+            let mut ime = IME_BUFFER.lock().unwrap();
+
+            ime.text.clear();
+            ime.composing = false;
+            ime.enabled = false;
+            ime.pending_enabled = allowed;
+            ime.pending_disabled = !allowed;
+        }
+
         if allowed {
+            // Start the platform IME buffer from a known state, so the edits
+            // reported by the platform can be diffed reliably.
+            self.app.set_text_input_state(TextInputState {
+                text: String::new(),
+                selection: TextSpan { start: 0, end: 0 },
+                compose_region: None,
+            });
             self.app.show_soft_input(true);
         } else {
             self.app.hide_soft_input(true);
