@@ -599,6 +599,14 @@ impl<T: 'static> EventLoop<T> {
         let text = state.text.trim_end_matches(&['\r', '\n'][..]);
         let submit = text.len() != state.text.len();
 
+        tracing::debug!(
+            target: "winit::android::ime",
+            text = ?state.text,
+            selection = ?state.selection,
+            compose = ?state.compose_region,
+            "ime text event"
+        );
+
         let (enabled, backspaces, commit) = {
             let mut ime = IME_BUFFER.lock().unwrap();
 
@@ -637,6 +645,15 @@ impl<T: 'static> EventLoop<T> {
 
             (enabled, backspaces, commit)
         };
+
+        tracing::debug!(
+            target: "winit::android::ime",
+            enabled,
+            backspaces,
+            commit = ?commit,
+            submit,
+            "ime replay"
+        );
 
         if submit {
             // The submission ends the editing session: start the platform
@@ -1168,27 +1185,34 @@ impl Window {
         });
     }
 
+    /// Returns the current contents of the platform IME buffer.
+    pub fn ime_text(&self) -> String {
+        IME_BUFFER.lock().unwrap().text.clone()
+    }
+
     pub fn set_ime_allowed(&self, allowed: bool) {
         {
             let mut ime = IME_BUFFER.lock().unwrap();
 
-            ime.text.clear();
             ime.enabled = false;
             ime.pending_enabled = allowed;
             ime.pending_disabled = !allowed;
+
+            if !allowed {
+                ime.text.clear();
+            }
         }
 
         if allowed {
-            // Start the platform IME buffer from a known state, so the edits
-            // reported by the platform can be diffed reliably. The focused
-            // widget seeds the actual contents through `set_ime_text`.
+            // The focused widget seeds the buffer through `set_ime_text`
+            // before the keyboard is shown, so the IME starts in sync.
+            self.app.show_soft_input(true);
+        } else {
             self.app.set_text_input_state(TextInputState {
                 text: String::new(),
                 selection: TextSpan { start: 0, end: 0 },
                 compose_region: None,
             });
-            self.app.show_soft_input(true);
-        } else {
             self.app.hide_soft_input(true);
         }
     }

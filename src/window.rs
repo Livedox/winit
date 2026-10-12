@@ -1305,6 +1305,18 @@ impl Window {
         self.window.maybe_queue_on_main(move |w| w.set_ime_text(&text, selection))
     }
 
+    /// Returns the current contents of the shared platform IME buffer.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **Android:** The buffer edited by the soft keyboard.
+    /// - **Other platforms:** Unsupported.
+    #[inline]
+    #[cfg(target_os = "android")]
+    pub fn ime_text(&self) -> String {
+        self.window.ime_text()
+    }
+
     /// Sets the IME purpose for the window using [`ImePurpose`].
     ///
     /// ## Platform-specific
