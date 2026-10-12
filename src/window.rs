@@ -1285,6 +1285,26 @@ impl Window {
         self.window.maybe_queue_on_main(move |w| w.set_ime_allowed(allowed))
     }
 
+    /// Seeds the platform IME buffer with the text and byte selection of the
+    /// focused widget.
+    ///
+    /// The platform edits this buffer while the soft keyboard is visible and
+    /// the edits are reported through [`WindowEvent::Ime`], so the buffer has
+    /// to start in sync with the widget contents.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **Android:** Seeds the shared text buffer edited by the soft keyboard.
+    /// - **Other platforms:** Unsupported.
+    ///
+    /// [`WindowEvent::Ime`]: crate::event::WindowEvent::Ime
+    #[inline]
+    #[cfg(target_os = "android")]
+    pub fn set_ime_text(&self, text: String, selection: (usize, usize)) {
+        let _span = tracing::debug_span!("winit::Window::set_ime_text").entered();
+        self.window.maybe_queue_on_main(move |w| w.set_ime_text(&text, selection))
+    }
+
     /// Sets the IME purpose for the window using [`ImePurpose`].
     ///
     /// ## Platform-specific

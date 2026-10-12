@@ -44,11 +44,8 @@ static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 /// previously seen buffer contents, which is translated into
 /// [`Ime`][event::Ime] events and synthetic backspaces.
 struct ImeBuffer {
-    /// The last contents reported by the platform, excluding the composing
-    /// region (which is reported through `Ime::Preedit` instead).
+    /// The last contents reported by the platform.
     text: String,
-    /// Whether the platform reported a composing region in the last event.
-    composing: bool,
     /// Whether an `Ime::Enabled` event was sent for the current session.
     enabled: bool,
     /// Whether `Ime::Enabled` / `Ime::Disabled` still have to be dispatched.
@@ -58,7 +55,6 @@ struct ImeBuffer {
 
 static IME_BUFFER: Mutex<ImeBuffer> = Mutex::new(ImeBuffer {
     text: String::new(),
-    composing: false,
     enabled: false,
     pending_enabled: false,
     pending_disabled: false,
@@ -603,7 +599,7 @@ impl<T: 'static> EventLoop<T> {
         let text = state.text.trim_end_matches(&['\r', '\n'][..]);
         let submit = text.len() != state.text.len();
 
-        let (enabled, preedit, backspaces, commit) = {
+        let (enabled, backspaces, commit) = {
             let mut ime = IME_BUFFER.lock().unwrap();
 
             let enabled = !ime.enabled;
@@ -612,52 +608,14 @@ impl<T: 'static> EventLoop<T> {
                 ime.pending_enabled = false;
             }
 
-            let composing = if submit {
-                // A submission commits the whole buffer.
-                None
-            } else {
-                state
-                    .compose_region
-                    .filter(|span| span.start < span.end)
-                    .map(|span| {
-                        (
-                            char_boundary_before(text, span.start),
-                            char_boundary_before(text, span.end),
-                        )
-                    })
-                    .filter(|(start, end)| start < end)
-            };
-
-            let base = match composing {
-                Some((start, end)) => {
-                    let mut base = String::with_capacity(text.len());
-                    base.push_str(&text[..start]);
-                    base.push_str(&text[end..]);
-                    base
-                },
-                None => text.to_owned(),
-            };
-
+            // The IME buffer is the source of truth for the text of the
+            // focused widget; any difference against the previously seen
+            // contents is an edit that has to be replayed into the widget.
+            let base = text.to_owned();
             let previous = std::mem::replace(&mut ime.text, base.clone());
 
-            let mut preedit = None;
             let mut backspaces = 0;
             let mut commit = None;
-
-            if let Some((start, end)) = composing {
-                let cursor =
-                    if state.selection.start >= start && state.selection.end <= end {
-                        Some((state.selection.start - start, state.selection.end - start))
-                    } else {
-                        None
-                    };
-
-                preedit = Some((text[start..end].to_owned(), cursor));
-                ime.composing = true;
-            } else if ime.composing {
-                preedit = Some((String::new(), None));
-                ime.composing = false;
-            }
 
             let (prefix, suffix) = ime_diff(&previous, &base);
 
@@ -677,7 +635,7 @@ impl<T: 'static> EventLoop<T> {
                 }
             }
 
-            (enabled, preedit, backspaces, commit)
+            (enabled, backspaces, commit)
         };
 
         if submit {
@@ -685,7 +643,6 @@ impl<T: 'static> EventLoop<T> {
             // buffer from a known state again.
             let mut ime = IME_BUFFER.lock().unwrap();
             ime.text.clear();
-            ime.composing = false;
             drop(ime);
 
             android_app.set_text_input_state(TextInputState {
@@ -699,14 +656,6 @@ impl<T: 'static> EventLoop<T> {
             let event = event::Event::WindowEvent {
                 window_id: window::WindowId(WindowId),
                 event: event::WindowEvent::Ime(event::Ime::Enabled),
-            };
-            callback(event, self.window_target());
-        }
-
-        if let Some((content, cursor)) = preedit {
-            let event = event::Event::WindowEvent {
-                window_id: window::WindowId(WindowId),
-                event: event::WindowEvent::Ime(event::Ime::Preedit(content, cursor)),
             };
             callback(event, self.window_target());
         }
@@ -1199,12 +1148,31 @@ impl Window {
 
     pub fn set_ime_cursor_area(&self, _position: Position, _size: Size) {}
 
+    /// Seeds the platform IME buffer with the text of the focused widget.
+    ///
+    /// The platform edits this buffer while the keyboard is visible and
+    /// `window_event` reports the differences against it as `WindowEvent::Ime`
+    /// events, so it has to start in sync with the widget.
+    pub fn set_ime_text(&self, text: &str, selection: (usize, usize)) {
+        {
+            let mut ime = IME_BUFFER.lock().unwrap();
+
+            ime.text.clear();
+            ime.text.push_str(text);
+        }
+
+        self.app.set_text_input_state(TextInputState {
+            text: text.to_owned(),
+            selection: TextSpan { start: selection.0, end: selection.1 },
+            compose_region: None,
+        });
+    }
+
     pub fn set_ime_allowed(&self, allowed: bool) {
         {
             let mut ime = IME_BUFFER.lock().unwrap();
 
             ime.text.clear();
-            ime.composing = false;
             ime.enabled = false;
             ime.pending_enabled = allowed;
             ime.pending_disabled = !allowed;
@@ -1212,7 +1180,8 @@ impl Window {
 
         if allowed {
             // Start the platform IME buffer from a known state, so the edits
-            // reported by the platform can be diffed reliably.
+            // reported by the platform can be diffed reliably. The focused
+            // widget seeds the actual contents through `set_ime_text`.
             self.app.set_text_input_state(TextInputState {
                 text: String::new(),
                 selection: TextSpan { start: 0, end: 0 },
