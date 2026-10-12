@@ -579,7 +579,7 @@ impl<T: 'static> EventLoop<T> {
                 }
             },
             InputEvent::TextEvent(state) => {
-                self.handle_ime_text(state, callback);
+                self.handle_ime_text(android_app, state, callback);
             },
             _ => {
                 warn!("Unknown android_activity input event {event:?}")
@@ -589,10 +589,20 @@ impl<T: 'static> EventLoop<T> {
         input_status
     }
 
-    fn handle_ime_text<F>(&mut self, state: &TextInputState, callback: &mut F)
-    where
+    fn handle_ime_text<F>(
+        &mut self,
+        android_app: &AndroidApp,
+        state: &TextInputState,
+        callback: &mut F,
+    ) where
         F: FnMut(event::Event<T>, &RootAEL),
     {
+        // Some soft keyboards report the IME action ("Done"/"Go") as a
+        // trailing newline in the text buffer; forward it as `Enter` instead
+        // so that widgets can treat it as a submission.
+        let text = state.text.trim_end_matches(&['\r', '\n'][..]);
+        let submit = text.len() != state.text.len();
+
         let (enabled, preedit, backspaces, commit) = {
             let mut ime = IME_BUFFER.lock().unwrap();
 
@@ -602,25 +612,30 @@ impl<T: 'static> EventLoop<T> {
                 ime.pending_enabled = false;
             }
 
-            let composing = state
-                .compose_region
-                .filter(|span| span.start < span.end)
-                .map(|span| {
-                    (
-                        char_boundary_before(&state.text, span.start),
-                        char_boundary_before(&state.text, span.end),
-                    )
-                })
-                .filter(|(start, end)| start < end);
+            let composing = if submit {
+                // A submission commits the whole buffer.
+                None
+            } else {
+                state
+                    .compose_region
+                    .filter(|span| span.start < span.end)
+                    .map(|span| {
+                        (
+                            char_boundary_before(text, span.start),
+                            char_boundary_before(text, span.end),
+                        )
+                    })
+                    .filter(|(start, end)| start < end)
+            };
 
             let base = match composing {
                 Some((start, end)) => {
-                    let mut base = String::with_capacity(state.text.len());
-                    base.push_str(&state.text[..start]);
-                    base.push_str(&state.text[end..]);
+                    let mut base = String::with_capacity(text.len());
+                    base.push_str(&text[..start]);
+                    base.push_str(&text[end..]);
                     base
                 },
-                None => state.text.clone(),
+                None => text.to_owned(),
             };
 
             let previous = std::mem::replace(&mut ime.text, base.clone());
@@ -637,7 +652,7 @@ impl<T: 'static> EventLoop<T> {
                         None
                     };
 
-                preedit = Some((state.text[start..end].to_owned(), cursor));
+                preedit = Some((text[start..end].to_owned(), cursor));
                 ime.composing = true;
             } else if ime.composing {
                 preedit = Some((String::new(), None));
@@ -665,6 +680,21 @@ impl<T: 'static> EventLoop<T> {
             (enabled, preedit, backspaces, commit)
         };
 
+        if submit {
+            // The submission ends the editing session: start the platform
+            // buffer from a known state again.
+            let mut ime = IME_BUFFER.lock().unwrap();
+            ime.text.clear();
+            ime.composing = false;
+            drop(ime);
+
+            android_app.set_text_input_state(TextInputState {
+                text: String::new(),
+                selection: TextSpan { start: 0, end: 0 },
+                compose_region: None,
+            });
+        }
+
         if enabled {
             let event = event::Event::WindowEvent {
                 window_id: window::WindowId(WindowId),
@@ -682,35 +712,54 @@ impl<T: 'static> EventLoop<T> {
         }
 
         for _ in 0..backspaces {
-            for state in [event::ElementState::Pressed, event::ElementState::Released] {
-                let key_event = event::KeyEvent {
-                    state,
-                    physical_key: crate::keyboard::PhysicalKey::Code(
-                        crate::keyboard::KeyCode::Backspace,
-                    ),
-                    logical_key: crate::keyboard::Key::Named(crate::keyboard::NamedKey::Backspace),
-                    location: crate::keyboard::KeyLocation::Standard,
-                    repeat: false,
-                    text: None,
-                    platform_specific: KeyEventExtra {},
-                };
-
-                let event = event::Event::WindowEvent {
-                    window_id: window::WindowId(WindowId),
-                    event: event::WindowEvent::KeyboardInput {
-                        device_id: event::DeviceId(DeviceId::dummy()),
-                        event: key_event,
-                        is_synthetic: true,
-                    },
-                };
-                callback(event, self.window_target());
-            }
+            self.send_synthetic_key(
+                crate::keyboard::Key::Named(crate::keyboard::NamedKey::Backspace),
+                crate::keyboard::PhysicalKey::Code(crate::keyboard::KeyCode::Backspace),
+                callback,
+            );
         }
 
         if let Some(text) = commit {
             let event = event::Event::WindowEvent {
                 window_id: window::WindowId(WindowId),
                 event: event::WindowEvent::Ime(event::Ime::Commit(text)),
+            };
+            callback(event, self.window_target());
+        }
+
+        if submit {
+            self.send_synthetic_key(
+                crate::keyboard::Key::Named(crate::keyboard::NamedKey::Enter),
+                crate::keyboard::PhysicalKey::Code(crate::keyboard::KeyCode::Enter),
+                callback,
+            );
+        }
+    }
+
+    fn send_synthetic_key<F>(
+        &self,
+        logical_key: crate::keyboard::Key,
+        physical_key: crate::keyboard::PhysicalKey,
+        callback: &mut F,
+    ) where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        for state in [event::ElementState::Pressed, event::ElementState::Released] {
+            let event = event::Event::WindowEvent {
+                window_id: window::WindowId(WindowId),
+                event: event::WindowEvent::KeyboardInput {
+                    device_id: event::DeviceId(DeviceId::dummy()),
+                    event: event::KeyEvent {
+                        state,
+                        physical_key: physical_key.clone(),
+                        logical_key: logical_key.clone(),
+                        location: crate::keyboard::KeyLocation::Standard,
+                        repeat: false,
+                        text: None,
+                        platform_specific: KeyEventExtra {},
+                    },
+                    is_synthetic: true,
+                },
             };
             callback(event, self.window_target());
         }
