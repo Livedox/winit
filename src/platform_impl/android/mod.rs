@@ -1221,31 +1221,6 @@ impl Window {
         if allowed {
             // The focused widget seeds the buffer through `set_ime_text`
             // before the keyboard is shown, so the IME starts in sync.
-            //
-            // Tell the IME to report the action key as "Done" instead of
-            // leaving it up to the keyboard (some keyboards use it for
-            // autocorrection otherwise).
-            const TYPE_CLASS_TEXT: i32 = 0x00000001;
-            const IME_ACTION_DONE: i32 = 0x00000006;
-
-            extern "C" {
-                fn GameActivity_setImeEditorInfo(
-                    activity: *mut std::ffi::c_void,
-                    inputType: i32,
-                    actionId: i32,
-                    imeOptions: i32,
-                );
-            }
-
-            unsafe {
-                GameActivity_setImeEditorInfo(
-                    self.app.activity_as_ptr(),
-                    TYPE_CLASS_TEXT,
-                    IME_ACTION_DONE,
-                    0,
-                );
-            }
-
             self.app.show_soft_input(true);
         } else {
             self.app.set_text_input_state(TextInputState {
