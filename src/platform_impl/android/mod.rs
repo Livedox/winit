@@ -633,8 +633,9 @@ impl<T: 'static> EventLoop<T> {
 
                 // The platform may wipe the buffer on its own (e.g. after the
                 // keyboard was hidden); that shouldn't be reported as the user
-                // deleting the whole text.
-                if removed != previous {
+                // deleting the whole text. Deleting the last remaining
+                // character is still a normal edit.
+                if removed != previous || previous.chars().count() <= 1 {
                     backspaces = removed.chars().count();
                 }
 
@@ -1220,6 +1221,31 @@ impl Window {
         if allowed {
             // The focused widget seeds the buffer through `set_ime_text`
             // before the keyboard is shown, so the IME starts in sync.
+            //
+            // Tell the IME to report the action key as "Done" instead of
+            // leaving it up to the keyboard (some keyboards use it for
+            // autocorrection otherwise).
+            const TYPE_CLASS_TEXT: i32 = 0x00000001;
+            const IME_ACTION_DONE: i32 = 0x00000006;
+
+            extern "C" {
+                fn GameActivity_setImeEditorInfo(
+                    activity: *mut std::ffi::c_void,
+                    inputType: i32,
+                    actionId: i32,
+                    imeOptions: i32,
+                );
+            }
+
+            unsafe {
+                GameActivity_setImeEditorInfo(
+                    self.app.activity_as_ptr(),
+                    TYPE_CLASS_TEXT,
+                    IME_ACTION_DONE,
+                    0,
+                );
+            }
+
             self.app.show_soft_input(true);
         } else {
             self.app.set_text_input_state(TextInputState {
